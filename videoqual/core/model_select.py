@@ -1,0 +1,88 @@
+"""Turning a row's model *choice* into the concrete ffmpeg `model=` value.
+
+This is pure decision logic with no Qt and no I/O, so it lives in core and is
+testable on its own -- it used to sit in main_window.py, which meant the test
+for 4K auto-selection had to import a private name out of a UI module.
+"""
+from __future__ import annotations
+
+from videoqual.core.builtin_models import builtin_choice, builtin_model_path, is_builtin_model_choice
+from videoqual.core.models import VmafOptions
+
+# A distorted video at or above this resolution is considered UHD/4K for the
+# purpose of auto-selecting the 4K VMAF model (matches the "4K or higher" ask).
+UHD_WIDTH_THRESHOLD = 3840
+UHD_HEIGHT_THRESHOLD = 2160
+
+DEFAULT_MODEL = "version=vmaf_v0.6.1"
+UHD_MODEL = "version=vmaf_4k_v0.6.1"
+
+# The two sentinel values a row's `model_choice` can hold instead of a real
+# ffmpeg model string.
+AUTO_MODEL_CHOICE = "__auto__"
+CUSTOM_MODEL_CHOICE = "__custom__"
+
+
+def model_for_resolution(width: int, height: int) -> str:
+    """The model auto-selection would pick for a distorted video of this size."""
+    if width >= UHD_WIDTH_THRESHOLD or height >= UHD_HEIGHT_THRESHOLD:
+        return UHD_MODEL
+    return DEFAULT_MODEL
+
+
+def resolve_model(options: VmafOptions, width: int, height: int) -> str:
+    """Resolves a row's model_choice (+ custom_model_path) into the concrete
+    ffmpeg model= value, applying 4K auto-selection if chosen.
+
+    `width`/`height` are the size the two videos are actually COMPARED at,
+    not either input's own resolution -- one side is scaled to the other
+    before libvmaf sees it, so a 1080p encode measured with "upscale
+    distorted to source" against a 4K master is a 4K comparison. See
+    vmaf_runner.analysis_dimensions.
+
+    Raises ValueError if the row asks for a custom model but names no file.
+    """
+    if options.model_choice == CUSTOM_MODEL_CHOICE:
+        if not options.custom_model_path:
+            raise ValueError("No custom model file selected.")
+        # run_vmaf() copies this into its per-run temp dir and references
+        # it by bare filename, so the raw absolute path is fine here.
+        return f"path={options.custom_model_path}"
+    if is_builtin_model_choice(options.model_choice):
+        model_id = options.model_choice.removeprefix("__builtin:")
+        return f"path={builtin_model_path(model_id)}"
+    if options.model_choice == AUTO_MODEL_CHOICE:
+        return model_for_resolution(width, height)
+    return options.model_choice
+
+
+# VMAF v1's Auto: the 1080p model at three screen heights below 4K, the 4K
+# model at one and a half above -- the viewing conditions v0.6.1's standard
+# and 4K models were made for, so Auto means the same in both columns.
+V1_DEFAULT_MODEL = builtin_choice("vmaf_v1_3d0h")
+V1_UHD_MODEL = builtin_choice("vmaf_v1_1d5h_2160")
+
+
+def v1_model_for_resolution(width: int, height: int) -> str:
+    """The bundled VMAF v1 model Auto picks for frames compared at this size."""
+    if width >= UHD_WIDTH_THRESHOLD or height >= UHD_HEIGHT_THRESHOLD:
+        return V1_UHD_MODEL
+    return V1_DEFAULT_MODEL
+
+
+def resolve_v1_model(options: VmafOptions, width: int, height: int) -> str:
+    """The ffmpeg model= value for the row's VMAF v1 choice ("path=<file>")."""
+    choice = options.model_choice_v1
+    if choice == AUTO_MODEL_CHOICE:
+        choice = v1_model_for_resolution(width, height)
+    if not is_builtin_model_choice(choice):
+        raise ValueError(f"Not a VMAF v1 model: {choice}")
+    return f"path={builtin_model_path(choice.removeprefix('__builtin:'))}"
+
+
+def is_v1_choice(choice: str | None) -> bool:
+    """A bundled VMAF v1 model. Before VMAF v1 had its own column these were
+    choices for the one VMAF column, so old rows, results and saved scores
+    can carry one as their VMAF model."""
+    return bool(choice) and is_builtin_model_choice(choice)
+
