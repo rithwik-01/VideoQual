@@ -1,0 +1,1220 @@
+"""Builds and runs the ffmpeg + libvmaf command, streaming progress and
+parsing the resulting per-frame JSON log.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import numpy as np
+
+from videoqual.core import gpu_frames, vmaf_cuda
+from videoqual.core import proc as proc_util
+from videoqual.core.crop_detect import CropDetectCancelled, common_picture, detect_crop, detect_pair
+from videoqual.core.ffmpeg_locate import VIDEO_STREAM, check_tools, ffmpeg_path, format_version
+from videoqual.core.frame_coverage import short_comparison
+from videoqual.core.frame_sync import FRAMESYNC_OPTS
+from videoqual.core.geometry import (
+    analysis_dimensions,
+    content_size,
+    display_aspect_ratio,
+    pair_problem,
+    resample_analysis_dimensions,
+)
+from videoqual.core.gpu import (
+    GPU_PASS,
+    GPU_WAIT_MESSAGE,
+    HwAccelPlan,
+    analysis_pix_fmt,
+    plan_hwaccel,
+)
+from videoqual.core.gpu import (
+    bit_depth as _bit_depth,
+)
+from videoqual.core.gpu import (
+    hw_native_format as _hw_native_format,
+)
+from videoqual.core.gpu import (
+    hwaccel_args as _hwaccel_args,
+)
+from videoqual.core.isolated import run_isolated
+from videoqual.core.metric_results import current_ffmpeg_provenance, results_from_frame_scores
+from videoqual.core.model_select import AUTO_MODEL_CHOICE, model_for_resolution, resolve_v1_model
+from videoqual.core.models import (
+    ComparisonResult,
+    CropBox,
+    CropMode,
+    FrameScores,
+    ScaleDirection,
+    VideoInfo,
+    VmafOptions,
+    synthetic_resample_distorted_path,
+)
+from videoqual.core.process_control import ProcessHandle
+from videoqual.core.status import GPU_VMAF_FAILED, GPU_WAIT, STARTING, Status
+
+_log = logging.getLogger(__name__)
+
+
+def _command_text(command) -> str:
+    """A command as a copy-pasteable line for the log; never raises -- a log
+    line must not be able to stop a run."""
+    try:
+        return subprocess.list2cmdline(command)
+    except TypeError:
+        return repr(command)
+
+ProgressCallback = Callable[[int, int, float], None]  # (current_frame, total_frames, fps)
+
+
+def _metric_results_for_current_run(frames: FrameScores, model: str, model_v1: str = "",
+                                    gpu_keys: set[str] | None = None):
+    """Adapt one FFmpeg parse into generic results without re-parsing it.
+    `gpu_keys`: VMAF and NEG scored on the GPU (vmaf_cuda) -- the same
+    request identity as FFmpeg's libvmaf (their scores agree to within
+    4e-5), recorded as GPU scores of the bundled build."""
+    status = check_tools()
+    version = format_version(status.ffmpeg.version) if status.ffmpeg.runnable else "unknown"
+
+    def provenance(key: str):
+        parameters = ({"model": "version=vmaf_v0.6.1neg"} if key == "vmaf_neg"
+                      else {"model": model} if key == "vmaf"
+                      else {"model": model_v1} if key == "vmaf_v1" else None)
+        made = current_ffmpeg_provenance(key, version, parameters)
+        if key in (gpu_keys or ()):
+            made = replace(made, implementation="libvmaf/cuda", implementation_version=vmaf_cuda.LIBRARY_BUILD,
+                           compute_backend="gpu")
+        return made
+
+    return results_from_frame_scores(frames, {key: provenance(key) for key in frames.metric_keys})
+
+
+class VmafRunError(RuntimeError):
+    def __init__(self, message: str, stderr_tail: str = ""):
+        super().__init__(message)
+        self.stderr_tail = stderr_tail
+
+
+class Cancelled(RuntimeError):  # noqa: N818 - a cancellation, not an error condition
+    """Raised when the user cancels a run mid-flight. Deliberately not named
+    `CancelledError`: nothing went wrong, and callers treat it as an expected
+    outcome rather than a failure to report."""
+
+
+def validate_video_pair(
+    source_info: VideoInfo, distorted_info: VideoInfo, options: VmafOptions
+) -> None:
+    """Rejects comparisons whose timelines are ambiguous (geometry.pair_problem)."""
+    if problem := pair_problem(source_info, distorted_info, options.duration_limit):
+        raise VmafRunError(problem)
+
+
+#: Two shapes count as the same if they agree to within this fraction. Wide
+#: enough for the rounding that even dimensions force (1918x1080 against
+#: 1920x1080 differs by 0.1%), far tighter than any real mismatch: 4:3
+#: against 16:9 is 33% apart, and the letterbox case below is 32%.
+_ASPECT_TOLERANCE = 0.01
+
+
+def validate_display_geometry(
+    source_info: VideoInfo, distorted_info: VideoInfo,
+    source_crop: CropBox | None, distorted_crop: CropBox | None,
+) -> None:
+    """Rejects a pair whose pictures are different shapes after cropping.
+
+    The filtergraph scales one side to the other's exact width and height,
+    which silently stretches a mismatched shape until libvmaf accepts it.
+    The result is a real number computed from a geometrically wrong
+    comparison, and it looks like any other score: a 1920x1080 source whose
+    content is a letterboxed 1920x816, compared with crop off against an
+    already-cropped 960x408 encode of it, scored 0.4977 -- against 87.14
+    for the same pair cropped correctly.
+
+    Run after crops are resolved, because cropping is exactly what makes a
+    letterboxed source and a cropped encode comparable. Before it they
+    legitimately differ.
+    """
+    source_dar = display_aspect_ratio(source_info, source_crop)
+    distorted_dar = display_aspect_ratio(distorted_info, distorted_crop)
+    if source_dar <= 0 or distorted_dar <= 0:
+        return  # degenerate metadata; nothing meaningful to compare
+    if abs(source_dar - distorted_dar) <= _ASPECT_TOLERANCE * max(source_dar, distorted_dar):
+        return
+
+    def describe(info: VideoInfo, crop: CropBox | None, dar: float) -> str:
+        shape = f"{crop.w}x{crop.h} (cropped)" if crop else f"{info.width}x{info.height}"
+        return f"{shape}, {dar:.3f}:1"
+
+    raise VmafRunError(
+        "The two videos are different shapes after cropping: "
+        f"source {describe(source_info, source_crop, source_dar)} versus "
+        f"distorted {describe(distorted_info, distorted_crop, distorted_dar)}. "
+        "Scoring them would stretch one to fit the other and the result would "
+        "be meaningless. If one is letterboxed, set black-bar handling to "
+        "'Auto-detect' so the bars are removed before comparison."
+    )
+
+
+def _resolve_crops(
+    source_info: VideoInfo, distorted_info: VideoInfo, options: VmafOptions,
+    status_callback: Callable[[str], None] | None,
+    cancel_event: threading.Event | None = None,
+    process_handle: ProcessHandle | None = None,
+    hwaccel: HwAccelPlan | None = None,
+) -> tuple[CropBox | None, CropBox | None]:
+    """`hwaccel` is the run's own decode plan; each input's detection windows
+    decode the same way the run will. Speed only -- the box is the same."""
+    if options.crop_mode == CropMode.NONE:
+        return None, None
+
+    plan = hwaccel or HwAccelPlan()
+    if status_callback:
+        status_callback("Detecting black bars in source and distorted...")
+    try:
+        boxes = detect_pair(
+            lambda: detect_crop(
+                source_info, cancel_event=cancel_event, process_handle=process_handle,
+                hwaccel=plan.source,
+            ),
+            lambda: detect_crop(
+                distorted_info, cancel_event=cancel_event, process_handle=process_handle,
+                hwaccel=plan.distorted,
+            ),
+        )
+    except CropDetectCancelled as e:
+        raise Cancelled("Cancelled by user") from e
+    return common_picture(source_info, distorted_info, *boxes)
+
+
+def auto_threads(concurrent_jobs: int = 1) -> int:
+    """How many threads "Auto" (n_threads <= 0) means for libvmaf.
+
+    Every logical core for a video scored on its own. When several are
+    scored at once each gets an equal share, so two jobs on a 24-core
+    machine ask for 12 threads each rather than 24 each: twice as many
+    threads as cores cannot do more work than exactly as many, they only
+    take turns on the same cores and pay for the switching.
+    """
+    cores = os.cpu_count() or 1
+    return max(1, cores // max(1, concurrent_jobs))
+
+
+def _build_libvmaf_opts(options: VmafOptions, log_path: Path, model: str | None = None) -> list[str]:
+    # ffmpeg's filtergraph option parser can't reliably handle an absolute
+    # Windows path (drive-letter colon) as an option value, even escaped or
+    # quoted -- so ffmpeg is always launched with cwd=log_path.parent and we
+    # reference the log (and any custom model file) by bare filename here.
+    model_value = model if model is not None else options.model
+    v1_file = _v1_model_file(options)
+    if options.compute_vmaf_neg or v1_file is not None:
+        # Explicit names keep the output score arrays independent. The v1
+        # model file is copied next to the log by _execute_run.
+        models = ([model_value + r"\\:name=vmaf"] if options.compute_vmaf else [])
+        if v1_file is not None:
+            models.append(f"path={v1_file.name}" + r"\\:name=vmaf_v1")
+        if options.compute_vmaf_neg:
+            models.append(r"version=vmaf_v0.6.1neg\\:name=vmaf_neg")
+        model_value = "|".join(models)
+    opts = [
+        f"log_path={log_path.name}",
+        "log_fmt=json",
+        f"model={model_value}" if _uses_vmaf_model(options) else "model=''",
+    ]
+    # libvmaf 2.0+ defaults to single-threaded (n_threads=1) unless told
+    # otherwise -- omitting this option here does NOT mean "use all cores",
+    # so "Auto" (n_threads <= 0) is resolved to the actual core count instead
+    # of leaving it unset. A job that shares the machine with another has
+    # already had its share filled in by the worker (VmafWorker._share_cores).
+    resolved_threads = options.n_threads if options.n_threads > 0 else auto_threads()
+    opts.append(f"n_threads={resolved_threads}")
+    if options.n_subsample > 1:
+        opts.append(f"n_subsample={options.n_subsample}")
+    if options.extra_features:
+        opts.append("feature=" + "|".join(options.extra_features))
+    opts += FRAMESYNC_OPTS
+    return opts
+
+
+def _uses_vmaf_model(options: VmafOptions) -> bool:
+    return options.compute_vmaf or options.compute_vmaf_neg or options.compute_vmaf_v1
+
+
+def _v1_model_file(options: VmafOptions) -> Path | None:
+    """The VMAF v1 model file a run uses, once the run has resolved it."""
+    if options.compute_vmaf_v1 and options.model_v1.startswith("path="):
+        return Path(options.model_v1.removeprefix("path="))
+    return None
+
+
+#: overlay's name for each analysis format it holds unchanged. It has none
+#: for 12-bit, which is therefore scored on the CPU (vmaf_cuda.scores_on_gpu).
+_OVERLAY_FORMAT = {"yuv420p": "yuv420", "yuv420p10le": "yuv420p10"}
+
+
+def _gpu_pairs_stage(analysis_format: str, width: int, height: int, main_label: str, ref_label: str) -> str:
+    """The frame pairs FFmpeg's libvmaf filter compares, as the raw outputs
+    [vmaf_dist] and [vmaf_ref] that VMAF on the GPU reads: the two streams
+    are synchronized by overlay with libvmaf's own frame sync options
+    (FRAMESYNC_OPTS), side by side in one frame, and cut apart again,
+    every pixel unchanged.
+
+    The two outputs used to come straight from the two streams, paired by
+    position, where libvmaf pairs them by timestamp: on a test video whose
+    timestamps were a fraction of a millisecond from the source's, libvmaf
+    on the CPU compared 239 frames and the GPU 240 -- and with VMAF v1,
+    PSNR, SSIM or XPSNR beside it, VMAF on the GPU was refused and the
+    video calculated again on the CPU.
+
+    For an even width and height only (vmaf_cuda.scores_on_gpu sends an odd
+    comparison to the CPU): pad gives a 4:2:0 picture an even size and
+    blacks out an odd one's last column and row, and crop cuts on whole
+    chroma samples. An odd width was once given an even offset here, and
+    the run still failed in FFmpeg, every time."""
+    if width & 1 or height & 1:
+        raise ValueError(f"the GPU's frame pairs need an even size, not {width}x{height}")
+    sync = ":".join(FRAMESYNC_OPTS)
+    return (f"[{main_label}]pad={2 * width}:{height}[vmaf_canvas];"
+            f"[vmaf_canvas][{ref_label}]overlay=x={width}:y=0:eval=init:"
+            f"format={_OVERLAY_FORMAT[analysis_format]}:{sync},split=2[vmaf_left][vmaf_right];"
+            f"[vmaf_left]crop={width}:{height}:0:0[vmaf_dist];"
+            f"[vmaf_right]crop={width}:{height}:{width}:0[vmaf_ref]")
+
+
+def analysis_bit_depth(source_info: VideoInfo, distorted_info: VideoInfo) -> int:
+    """The bit depth two videos are compared at (analysis_pix_fmt)."""
+    return _bit_depth(analysis_pix_fmt(source_info.pix_fmt, distorted_info.pix_fmt))
+
+
+def _build_libvmaf_stage(
+    options: VmafOptions, log_path: Path, model: str | None, xpsnr_log_path: Path | None,
+    main_label: str = "main", ref_label: str = "ref", output_label: str = "",
+) -> str:
+    """The XPSNR + libvmaf tail shared by both filtergraph builders. XPSNR
+    isn't a libvmaf "feature" like PSNR/SSIM -- it's a fully separate ffmpeg
+    filter with its own stats file -- so when requested it sits between
+    decode and libvmaf, passing [main] through under a new label.
+    `output_label` names its output (the GPU VMAF graph maps it explicitly).
+    """
+    if not options.requested_metrics():
+        raise VmafRunError("Select at least one metric to calculate.")
+    output = f"[{output_label}]" if output_label else ""
+    # XPSNR-only needs no libvmaf filter or model at all.
+    if not _uses_vmaf_model(options) and not options.extra_features:
+        assert xpsnr_log_path is not None
+        return (f"[{main_label}][{ref_label}]xpsnr=stats_file={xpsnr_log_path.name}:"
+                + ":".join(FRAMESYNC_OPTS) + output)
+    libvmaf_opts = _build_libvmaf_opts(options, log_path, model)
+    chains = []
+    if options.compute_xpsnr and xpsnr_log_path is not None:
+        # xpsnr consumes [ref], and libvmaf needs it too -- but a filtergraph
+        # label can only be consumed once. Without this explicit split,
+        # ffmpeg silently wires libvmaf up to the wrong stream and it ends up
+        # comparing the distorted video against itself, reporting a perfect
+        # VMAF 100 / PSNR 60 / SSIM 1.0 for every frame no matter how bad the
+        # encode actually is. It does NOT error out, so the scores just come
+        # back quietly, plausibly wrong.
+        chains.append(f"[{ref_label}]split=2[ref_xpsnr][ref_vmaf]")
+        chains.append(
+            f"[{main_label}][ref_xpsnr]xpsnr=stats_file={xpsnr_log_path.name}:"
+            + ":".join(FRAMESYNC_OPTS) + "[xmain]"
+        )
+        main_label = "xmain"
+        ref_label = "ref_vmaf"
+    chains.append(f"[{main_label}][{ref_label}]libvmaf=" + ":".join(libvmaf_opts) + output)
+    return ";".join(chains)
+
+
+def _build_filtergraph(
+    source_info: VideoInfo, distorted_info: VideoInfo, options: VmafOptions,
+    source_crop: CropBox | None, distorted_crop: CropBox | None,
+    hwaccel: HwAccelPlan, log_path: Path, model: str | None = None,
+    xpsnr_log_path: Path | None = None, gpu_vmaf: bool = False,
+) -> str:
+    """`gpu_vmaf`: VMAF and NEG are scored on the GPU (vmaf_cuda), from the
+    compared frames as two raw outputs, [vmaf_dist] and [vmaf_ref], and are
+    all the run scores: FFmpeg's own filters score nothing."""
+    dist_content_w, dist_content_h = content_size(distorted_info, distorted_crop)
+    ref_content_w, ref_content_h = content_size(source_info, source_crop)
+    resolutions_differ = (ref_content_w, ref_content_h) != (dist_content_w, dist_content_h)
+    upscale_distorted = resolutions_differ and options.scale_direction == ScaleDirection.DISTORTED_TO_SOURCE
+
+    # Both branches have to reach libvmaf in the same pixel format, and that
+    # format is chosen from the deeper of the two inputs -- see
+    # analysis_pix_fmt for why it is not simply yuv420p.
+    analysis_format = analysis_pix_fmt(source_info.pix_fmt, distorted_info.pix_fmt)
+
+    # --- distorted (main, input 0) chain ---
+    main_ops = []
+    if hwaccel.distorted:
+        # Same shape as the reference chain below: frames arrive as hardware
+        # surfaces and have to come back to system memory before any filter
+        # that isn't hardware-aware -- including the crop -- can touch them.
+        main_ops.append("hwdownload")
+        main_ops.append(f"format={_hw_native_format(distorted_info.pix_fmt)}")
+    if distorted_crop and not distorted_crop.is_noop(distorted_info.width, distorted_info.height):
+        main_ops.append(distorted_crop.as_filter())
+    main_ops.append(f"format={analysis_format}")
+    if upscale_distorted:
+        # Scale the distorted video UP to the source's resolution instead of
+        # the default (scaling the source down to the distorted video's
+        # resolution) -- see ScaleDirection.
+        main_ops.append(f"scale={ref_content_w}:{ref_content_h}:flags={options.scale_algorithm}")
+    main_ops.append("setpts=PTS-STARTPTS")
+    main_chain = f"[0:{VIDEO_STREAM}]{','.join(main_ops)}[main]"
+
+    # --- source / reference (input 1) chain ---
+    ref_ops = []
+    if hwaccel.source:
+        # hwdownload can only emit the hw surface's native format -- nv12 for
+        # 8-bit cuda decode, p010le for 10-bit (common for UHD/HDR masters) --
+        # it can't itself target the analysis format, so that conversion
+        # needs its own separate format filter afterwards.
+        ref_ops.append("hwdownload")
+        ref_ops.append(f"format={_hw_native_format(source_info.pix_fmt)}")
+    # Cropped before the format conversion, as the distorted chain is (and
+    # Vship's, the CPU tools' and the GPU decoders'): converted first, a
+    # 4:2:2 or 4:4:4 source's chroma at the crop's edges was filtered with
+    # samples of the bars cut off.
+    if source_crop and not source_crop.is_noop(source_info.width, source_info.height):
+        ref_ops.append(source_crop.as_filter())
+    ref_ops.append(f"format={analysis_format}")
+
+    if resolutions_differ and not upscale_distorted:
+        ref_ops.append(f"scale={dist_content_w}:{dist_content_h}:flags={options.scale_algorithm}")
+
+    ref_ops.append("setpts=PTS-STARTPTS")
+    ref_chain = f"[1:{VIDEO_STREAM}]{','.join(ref_ops)}[ref]"
+
+    compared_w, compared_h = (
+        (ref_content_w, ref_content_h) if upscale_distorted else (dist_content_w, dist_content_h))
+    if not gpu_vmaf:
+        tail = _build_libvmaf_stage(options, log_path, model, xpsnr_log_path)
+    else:
+        tail = _gpu_pairs_stage(analysis_format, compared_w, compared_h, "main", "ref")
+    return ";".join([main_chain, ref_chain, tail])
+
+
+def _build_resample_test_filtergraph(
+    source_info: VideoInfo, options: VmafOptions, source_crop: CropBox | None,
+    hwaccel_used: str | None, log_path: Path, model: str | None = None,
+    xpsnr_log_path: Path | None = None,
+) -> str:
+    """A single-input filtergraph for a resolution round-trip test: the
+    source is decoded once and split into an untouched reference branch and
+    a "distorted" branch that's scaled down to the target width (preserving
+    the source's own aspect ratio) and back up to the source's original
+    resolution -- there's no second file, both branches come from the one input.
+    """
+    target = options.resample_test
+    assert target is not None
+
+    orig_w, orig_h = source_info.width, source_info.height
+    if source_crop and not source_crop.is_noop(source_info.width, source_info.height):
+        orig_w, orig_h = source_crop.w, source_crop.h
+
+    down_w = target.width
+    down_h = max(2, round(down_w * orig_h / orig_w / 2) * 2)  # even, preserves the source's own aspect ratio
+
+    # A round-trip test has one input, so the analysis format comes from
+    # the source alone -- see analysis_pix_fmt.
+    analysis_format = analysis_pix_fmt(source_info.pix_fmt)
+
+    base_ops = []
+    if hwaccel_used:
+        # See _build_filtergraph's identical comment: hwdownload can only
+        # emit the hw surface's native format, not the analysis format.
+        base_ops.append("hwdownload")
+        base_ops.append(f"format={_hw_native_format(source_info.pix_fmt)}")
+    if source_crop and not source_crop.is_noop(source_info.width, source_info.height):
+        base_ops.append(source_crop.as_filter())  # before the conversion, as _build_filtergraph
+    base_ops.append(f"format={analysis_format}")
+    base_chain = f"[0:{VIDEO_STREAM}]{','.join(base_ops)}[base]"
+
+    split_chain = "[base]split=2[ref_src][dist_src]"
+    ref_chain = "[ref_src]setpts=PTS-STARTPTS[ref]"
+    dist_chain = (
+        f"[dist_src]scale={down_w}:{down_h}:flags={options.scale_algorithm},"
+        f"scale={orig_w}:{orig_h}:flags={options.scale_algorithm},setpts=PTS-STARTPTS[main]"
+    )
+
+    tail = _build_libvmaf_stage(options, log_path, model, xpsnr_log_path)
+    return ";".join([base_chain, split_chain, ref_chain, dist_chain, tail])
+
+
+_PROGRESS_FRAME_RE = re.compile(r"frame=(\d+)")
+_PROGRESS_FPS_RE = re.compile(r"fps=\s*([\d.]+)")
+
+
+def _build_ffmpeg_cmd(
+    distorted_path: Path, source_path: Path, filtergraph: str,
+    hwaccel: HwAccelPlan, duration_limit: float = 0.0,
+    gpu_outputs: list[str] | None = None,
+) -> list[str]:
+    cmd = [ffmpeg_path(), "-nostdin", "-hide_banner", "-y"]
+    # -i paths are plain argv (not filtergraph syntax) so absolute Windows
+    # paths are fine here even though they aren't inside the filtergraph --
+    # but they must be made absolute first, since ffmpeg's cwd is set to a
+    # temp dir below (see _build_filtergraph's log_path/model comment).
+    cmd += _hwaccel_args(hwaccel.distorted)
+    cmd += ["-i", str(Path(distorted_path).resolve())]
+    cmd += _hwaccel_args(hwaccel.source)
+    cmd += ["-i", str(Path(source_path).resolve())]
+    cmd += _build_ffmpeg_output_args(filtergraph, duration_limit, gpu_outputs)
+    return cmd
+
+
+def _build_resample_cmd(
+    source_path: Path, filtergraph: str, hwaccel: str | None, duration_limit: float = 0.0,
+) -> list[str]:
+    cmd = [ffmpeg_path(), "-nostdin", "-hide_banner", "-y"]
+    cmd += _hwaccel_args(hwaccel)
+    cmd += ["-i", str(Path(source_path).resolve())]
+    cmd += _build_ffmpeg_output_args(filtergraph, duration_limit)
+    return cmd
+
+
+def _build_ffmpeg_output_args(
+    filtergraph: str, duration_limit: float, gpu_outputs: list[str] | None = None,
+) -> list[str]:
+    """`gpu_outputs`: GPU VMAF's raw outputs (vmaf_cuda.GpuAttempt), each
+    with its own -t, and the run's only outputs."""
+    args = ["-lavfi", filtergraph, "-progress", "pipe:1", "-nostats"]
+    if gpu_outputs is not None:
+        return args + gpu_outputs
+    if duration_limit > 0:
+        # An output-side -t caps how much of the filtered output is produced
+        # (and so how many frames reach libvmaf), regardless of any length
+        # mismatch between the two inputs -- simpler than trying to bound
+        # each input separately.
+        args += ["-t", f"{duration_limit:.3f}"]
+    return [*args, "-f", "null", "-"]
+
+
+def _run_ffmpeg(
+    cmd: list[str], total_frames: int,
+    on_progress: ProgressCallback | None, cancel_event: threading.Event | None,
+    cwd: Path, process_handle: ProcessHandle | None = None,
+) -> subprocess.CompletedProcess:
+    # Checked before spawning, not only inside the read loop: cancelling
+    # during crop detection or between the fallback attempts would otherwise
+    # start one more ffmpeg that then had to be hunted down and killed.
+    if cancel_event is not None and cancel_event.is_set():
+        raise Cancelled("Cancelled by user")
+    # UTF-8, not the Windows code page: ffmpeg's stderr starts with the
+    # inputs' paths and tags, and a curly quote (”) in either is a byte cp1252
+    # cannot decode. That killed the drain thread, losing ffmpeg's error
+    # message and leaving nothing to empty the pipe.
+    proc = proc_util.popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(cwd),
+    )
+    if process_handle is not None:
+        process_handle.attach(proc.pid)
+    # Bound before the try so the finally can always reach it, even if the
+    # thread never got as far as being created.
+    stderr_thread: threading.Thread | None = None
+    try:
+        stderr_lines: list[str] = []
+
+        def _drain_stderr():
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_lines.append(line)
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        # ffmpeg's -progress output emits several key=value lines per update
+        # block (frame=, fps=, ..., progress=continue/end) rather than one
+        # combined line -- fps only changes once per block, so the latest
+        # value seen is carried forward and reported alongside every frame=
+        # update rather than waiting for both to land on the same line.
+        last_fps = 0.0
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if cancel_event is not None and cancel_event.is_set():
+                proc_util.terminate(proc)
+                break
+            fps_match = _PROGRESS_FPS_RE.match(line)
+            if fps_match:
+                last_fps = float(fps_match.group(1))
+                continue
+            m = _PROGRESS_FRAME_RE.match(line)
+            if m and on_progress:
+                on_progress(int(m.group(1)), total_frames, last_fps)
+
+        proc.wait()
+        stderr_thread.join(timeout=5)
+        # Checked again here (not just inside the loop above) because a
+        # paused process produces no more output for the loop to see -- it's
+        # only killed via ProcessHandle.terminate() from outside, which ends
+        # the loop through EOF rather than the in-loop check ever firing.
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled("Cancelled by user")
+        return subprocess.CompletedProcess(cmd, proc.returncode, "", "".join(stderr_lines))
+    finally:
+        # Anything can leave the block above early -- a cancellation, or an
+        # on_progress callback raising from inside the stdout loop -- and an
+        # ffmpeg left running holds its pipes and the log files inside the
+        # run's temp dir open. On Windows that makes the enclosing
+        # TemporaryDirectory fail to delete, so the leak is a visible one:
+        # files pile up in %TEMP% for the rest of the session.
+        _reap(proc, stderr_thread)
+        if process_handle is not None:
+            process_handle.detach(proc.pid)
+
+
+def _reap(proc: subprocess.Popen, drain_thread: threading.Thread | None) -> None:
+    """Ends `proc` if it is still running, then joins its reader and closes
+    its pipes -- in that order, so the drain thread sees a clean EOF rather
+    than having the file object closed underneath it.
+
+    Deliberately swallows its own errors: this runs in a finally block, and
+    the exception that sent us there (a Cancelled, or whatever a progress
+    callback raised) is the one the caller needs to see -- a secondary
+    failure while tidying up must not replace it.
+    """
+    with contextlib.suppress(Exception):  # see the docstring
+        if proc.poll() is None:
+            proc_util.terminate(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # terminate() is a polite request that a wedged decoder can
+                # ignore; kill() is not refusable.
+                proc_util.kill(proc)
+                proc.wait(timeout=5)
+    if drain_thread is not None:
+        drain_thread.join(timeout=5)
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            with contextlib.suppress(Exception):  # see the docstring
+                pipe.close()
+
+
+def estimate_total_frames(
+    reference_info: VideoInfo, options: VmafOptions, other_info: VideoInfo | None = None
+) -> int:
+    """The number of frames ffmpeg will process: `reference_info` is
+    whichever video drives the output timeline (the distorted video for a
+    normal run, the source for a resolution round-trip test), bounded by
+    duration_limit. libvmaf's n_subsample reduces how many frames receive a
+    score, but ffmpeg's progress counter still reports every decoded/output
+    frame, so applying n_subsample here made progress exceed 100% and broke
+    both ETAs. Used to size progress and estimate the queued work.
+
+    `other_info` is the second input of a two-input comparison. The graph now
+    stops at whichever input ends first (see FRAMESYNC_OPTS), so a distorted
+    file longer than its source produces fewer frames than its own length
+    suggests -- without this the progress bar would stop short of 100% and
+    the ETA would never be reached.
+    """
+    frame_count = reference_info.estimated_frame_count
+    if other_info is not None:
+        frame_count = min(frame_count, other_info.estimated_frame_count)
+    if options.duration_limit > 0:
+        frame_count = min(frame_count, round(options.duration_limit * reference_info.fps))
+    return frame_count
+
+
+def _resolve_model_for_cwd(model: str, tmpdir: Path) -> str:
+    """If `model` points at a custom model file (model="path=<file>"), copy
+    it into tmpdir and rewrite the option to reference it by bare filename,
+    for the same reason log_path is kept relative -- see _build_filtergraph.
+    """
+    if not model.startswith("path="):
+        return model
+    src = Path(model[len("path="):])
+    dest = tmpdir / src.name
+    shutil.copyfile(src, dest)
+    return f"path={dest.name}"
+
+
+def _parse_log(log_path: Path, fps: float, xpsnr_log_path: Path | None = None) -> FrameScores:
+    with open(log_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    xpsnr_by_frame = _parse_xpsnr_log(xpsnr_log_path) if xpsnr_log_path is not None else {}
+
+    # Accumulated as plain lists and packed into arrays at the end, rather
+    # than one FrameScore object per frame: a feature-length run is hundreds
+    # of thousands of frames, and those objects would be built only to be
+    # thrown away here.
+    frame_nums: list[int] = []
+    vmafs: list[float | None] = []
+    negs: list[float | None] = []
+    v1s: list[float | None] = []
+    psnrs: list[float | None] = []
+    ssims: list[float | None] = []
+    xpsnrs: list[float | None] = []
+
+    for fr in data.get("frames", []):
+        metrics = fr.get("metrics", {})
+        frame_num = int(fr.get("frameNum", len(frame_nums)))
+        vmaf = metrics.get("vmaf")
+        if not any(k in metrics for k in ("vmaf", "vmaf_neg", "vmaf_v1", "psnr_y", "psnr", "float_ssim", "ssim")):
+            continue
+        # `a if a is not None else b`, not `a or b`: libvmaf reports a real
+        # 0.0 for badly degraded frames, and `or` would discard it and fall
+        # through to the other key (or to None).
+        psnr = metrics.get("psnr_y")
+        if psnr is None:
+            psnr = metrics.get("psnr")
+        ssim = metrics.get("float_ssim")
+        if ssim is None:
+            ssim = metrics.get("ssim")
+        frame_nums.append(frame_num)
+        vmafs.append(None if vmaf is None else float(vmaf))
+        negs.append(metrics.get("vmaf_neg"))
+        v1s.append(metrics.get("vmaf_v1"))
+        psnrs.append(psnr)
+        ssims.append(ssim)
+        xpsnrs.append(xpsnr_by_frame.get(frame_num))
+
+    if not frame_nums:
+        return FrameScores.empty()
+
+    frame_arr = np.array(frame_nums, dtype=np.int32)
+    time_arr = frame_arr / fps if fps > 0 else np.zeros(len(frame_nums), dtype=np.float64)
+
+    def column(values: list[float | None]) -> np.ndarray | None:
+        if all(v is None for v in values):
+            return None  # metric wasn't requested for this run at all
+        return np.array([np.nan if v is None else v for v in values], dtype=np.float32)
+
+    return FrameScores(
+        frame=frame_arr,
+        time=time_arr,
+        vmaf=column(vmafs),
+        vmaf_neg=column(negs),
+        psnr=column(psnrs), ssim=column(ssims), xpsnr=column(xpsnrs),
+        metrics={"vmaf_v1": column(v1s)},
+    )
+
+
+_XPSNR_NUMBER = r"[+-]?(?:inf|nan|(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)"
+_XPSNR_LINE_RE = re.compile(
+    rf"n:\s*(\d+)\s+XPSNR y:\s*({_XPSNR_NUMBER})", re.IGNORECASE
+)
+
+
+def _parse_xpsnr_log(xpsnr_log_path: Path) -> dict[int, float]:
+    """Maps 0-indexed frame number -> XPSNR Y value. The xpsnr filter's own
+    stats file numbers frames from 1, while the rest of this app numbers
+    them from 0 (matching libvmaf's own frameNum) -- converted here so
+    callers never have to think about the mismatch.
+    """
+    if not xpsnr_log_path.exists():
+        return {}
+    result: dict[int, float] = {}
+    with open(xpsnr_log_path, encoding="utf-8") as f:
+        for line in f:
+            m = _XPSNR_LINE_RE.match(line)
+            if m:
+                result[int(m.group(1)) - 1] = float(m.group(2))
+    return result
+
+
+#: (hwaccel plan, model resolved relative to the run's temp dir, libvmaf
+#: log path, xpsnr log path or None) -> the ffmpeg argv to run. The two run
+#: flavours differ only in this, so _execute_run takes it as a parameter
+#: rather than duplicating the whole pipeline around it.
+CommandBuilder = Callable[..., list[str]]
+
+
+@dataclass(frozen=True)
+class _GpuPlan:
+    """VMAF and NEG scored on the GPU (vmaf_cuda), the run's only metrics:
+    libvmaf's models for them, and the size and depth frames are compared at."""
+    models: dict[str, str]
+    width: int
+    height: int
+    bit_depth: int
+
+
+def _gpu_frame_scores(gpu_scores, fps: float) -> FrameScores:
+    """The GPU's VMAF and NEG as the run's frame scores; VmafGpuError when it
+    scored no frame."""
+    numbers, scores = gpu_scores
+    if not len(numbers):
+        raise vmaf_cuda.VmafGpuError("GPU VMAF scored no frames")
+    time = numbers / fps if fps > 0 else np.zeros(len(numbers), dtype=np.float64)
+    return FrameScores(numbers, time, vmaf=scores.get("vmaf"), vmaf_neg=scores.get("vmaf_neg"))
+
+
+def _fallback_ladder(plan: HwAccelPlan) -> list[HwAccelPlan]:
+    """The plans to try, in order, until one of them runs.
+
+    Hardware decode can fail for reasons no capability table predicts: a
+    profile the fixed-function decoder does not implement, a driver that
+    reports the codec but rejects the specific bitstream, an exhausted
+    decode session. The distorted file is tried-then-dropped first because
+    it is the arbitrary one -- the source is usually a known-good master
+    while the distorted side is whatever encoder settings are under test.
+    """
+    ladder = [plan]
+    if plan.source is not None and plan.distorted is not None:
+        # The first single-input retry keeps the usually-known-good source
+        # accelerated. If that is actually the failing side, the symmetric
+        # retry still preserves acceleration for the distorted input.
+        ladder.append(HwAccelPlan(source=plan.source))
+        ladder.append(HwAccelPlan(distorted=plan.distorted))
+    if plan.uses_gpu:
+        ladder.append(HwAccelPlan())
+    return ladder
+
+
+def _with_v1_model(options: VmafOptions, dimensions: tuple[int, int]) -> VmafOptions:
+    """The options with VMAF v1's model resolved, Auto from the size frames
+    are compared at -- known only after black bars are detected, as for
+    VMAF v0.6.1's Auto (_auto_model_or)."""
+    if not options.compute_vmaf_v1:
+        return options
+    return replace(options, model_v1=resolve_v1_model(options, *dimensions))
+
+
+def _auto_model_or(options: VmafOptions, dimensions: tuple[int, int]) -> str:
+    """The model to actually run with. Only Auto is re-decided here; an
+    explicit or custom choice is the user's and is left alone."""
+    if not options.compute_vmaf:
+        return ""
+    if options.model_choice != AUTO_MODEL_CHOICE:
+        return options.model
+    return model_for_resolution(*dimensions)
+
+
+def _execute_run(
+    build_command: CommandBuilder,
+    *,
+    options: VmafOptions,
+    model: str | None = None,
+    fps: float,
+    total_frames: int,
+    hwaccel: HwAccelPlan,
+    tmp_prefix: str,
+    on_progress: ProgressCallback | None,
+    on_status: Callable[[str], None] | None,
+    cancel_event: threading.Event | None,
+    process_handle: ProcessHandle | None,
+    gpu: _GpuPlan | None = None,
+) -> FrameScores:
+    """Runs one ffmpeg invocation to completion and parses its logs.
+
+    With `gpu`, VMAF and NEG -- the run's only metrics -- are scored on the
+    GPU from FFmpeg's raw outputs (vmaf_cuda.GpuAttempt, one per attempt);
+    build_command then also takes those outputs' arguments.
+
+    Shared by run_vmaf and run_resample_test, which previously carried
+    byte-identical copies of the temp-dir setup, the GPU-decode fallback, the
+    exit-code/missing-log checks and the log parsing -- four places a fix had
+    to be remembered in, and one of them would eventually be missed.
+    """
+    if not options.requested_metrics():
+        raise VmafRunError("Select at least one metric to calculate.")
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+        log_path = tmpdir / "vmaf_log.json"
+        xpsnr_log_path = tmpdir / "xpsnr_log.txt" if options.compute_xpsnr else None
+        resolved_model = _resolve_model_for_cwd(
+            (model if model is not None else options.model) if options.compute_vmaf and gpu is None else "", tmpdir
+        )
+        gpu_scores = None
+        if (v1_file := _v1_model_file(options)) is not None:
+            shutil.copyfile(v1_file, tmpdir / v1_file.name)  # referenced by bare name, as above
+
+        def run_with(plan: HwAccelPlan):
+            nonlocal gpu_scores
+            if gpu is None:
+                cmd = build_command(plan, resolved_model, log_path, xpsnr_log_path)
+                _log.info("FFmpeg: %s", _command_text(cmd))
+                return _run_ffmpeg(
+                    cmd, total_frames, on_progress, cancel_event,
+                    cwd=tmpdir, process_handle=process_handle,
+                )
+            # A libvmaf context and pipes of its own for each attempt: a
+            # failed attempt's are spent.
+            attempt = vmaf_cuda.GpuAttempt(gpu.width, gpu.height, gpu.bit_depth, gpu.models, options.n_subsample)
+            try:
+                # One frame more than the limit: FFmpeg's libvmaf filter scores
+                # the first frame at or past it (stamped 30.03 s for a 30 s
+                # limit at 23.976 fps) before the null output stops there, and
+                # the raw outputs are to carry the same frames.
+                limit = options.duration_limit + 1 / fps if options.duration_limit > 0 and fps > 0 else 0.0
+                cmd = build_command(plan, resolved_model, log_path, xpsnr_log_path, attempt.output_args(limit))
+                _log.info("FFmpeg: %s", _command_text(cmd))
+                result = _run_ffmpeg(
+                    cmd, total_frames, on_progress, cancel_event,
+                    cwd=tmpdir, process_handle=process_handle,
+                )
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    attempt.finish(False)
+                raise
+            # Raises when libvmaf failed: FFmpeg failing then is its doing,
+            # and no decode retry would help.
+            gpu_scores = attempt.finish(result.returncode == 0)
+            return result
+
+        ladder = _fallback_ladder(hwaccel)
+        result = None
+        for attempt, plan in enumerate(ladder):
+            if on_status:
+                if attempt == 0:
+                    on_status(Status.decoding(f"Running ffmpeg{', VMAF on the GPU' if gpu is not None else ''}",
+                                              plan, ending="...", kind=STARTING))
+                else:
+                    on_status(Status.decoding("GPU decode failed, retrying", plan, ending="..."))
+            result = run_with(plan)
+            if result.returncode == 0:
+                break
+            _log.warning("FFmpeg exited with code %d (GPU decode: %s)%s. Last output:\n%s", result.returncode,
+                         plan.describe(), "; retrying" if attempt + 1 < len(ladder) else "",
+                         "\n".join(result.stderr.splitlines()[-25:]))
+            # A stale log from the failed attempt would otherwise be parsed
+            # as if the retry had produced it -- ffmpeg can write a partial
+            # log before the decoder gives up.
+            log_path.unlink(missing_ok=True)
+            if xpsnr_log_path is not None:
+                xpsnr_log_path.unlink(missing_ok=True)
+
+        assert result is not None  # the ladder always has at least one plan
+        if result.returncode != 0:
+            tail = "\n".join(result.stderr.splitlines()[-25:])
+            raise VmafRunError(f"ffmpeg exited with code {result.returncode}", stderr_tail=tail)
+
+        if gpu is not None:
+            frames = _gpu_frame_scores(gpu_scores, fps)
+        elif not _uses_vmaf_model(options) and not options.extra_features:
+            values = _parse_xpsnr_log(xpsnr_log_path)
+            numbers = np.array(sorted(values), dtype=np.int32)
+            frames = FrameScores(numbers, numbers / fps, None,
+                                 xpsnr=np.array([values[n] for n in numbers], dtype=np.float32))
+        else:
+            if not log_path.exists():
+                raise VmafRunError("ffmpeg finished but no metric log was produced.", stderr_tail=result.stderr[-2000:])
+            frames = _parse_log(log_path, fps, xpsnr_log_path)
+        missing = [m for m in options.requested_metrics() if not frames.has(m)]
+        if not frames or missing:
+            raise VmafRunError("No results for requested metrics: " + ", ".join(missing or options.requested_metrics()))
+        return frames
+
+
+def run_vmaf(
+    source_info: VideoInfo,
+    distorted_info: VideoInfo,
+    options: VmafOptions,
+    on_progress: ProgressCallback | None = None,
+    on_status: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    process_handle: ProcessHandle | None = None,
+    result_distorted_path: Path | None = None,
+) -> ComparisonResult:
+    """result_distorted_path overrides the returned result's `distorted`
+    identity (defaulting to distorted_info.path). It doesn't affect which
+    file is actually decoded -- only what identity the result carries for
+    caching/graphing -- so a caller running the *same* physical file twice
+    under different options (e.g. both ScaleDirection values) can give each
+    run a distinct identity instead of one colliding with/overwriting the
+    other, the same way a resample test's synthetic path already does.
+    """
+    validate_video_pair(source_info, distorted_info, options)
+
+    # Planned before crop detection rather than after, so the detection
+    # windows can decode the way the run will. The plan depends only on the
+    # codecs and the vendor, never on the crops.
+    hwaccel = HwAccelPlan()
+    if options.gpu_decode:
+        hwaccel = plan_hwaccel(
+            options.gpu_vendor, source_info.codec_name, distorted_info.codec_name,
+            source_pix_fmt=source_info.pix_fmt, distorted_pix_fmt=distorted_info.pix_fmt,
+            source_size=(source_info.width, source_info.height),
+            distorted_size=(distorted_info.width, distorted_info.height),
+        )
+
+    source_crop, distorted_crop = _resolve_crops(
+        source_info, distorted_info, options, on_status,
+        cancel_event=cancel_event, process_handle=process_handle, hwaccel=hwaccel,
+    )
+    # After cropping, not before: removing a letterbox is precisely what
+    # makes a padded source and an already-cropped encode the same shape.
+    validate_display_geometry(source_info, distorted_info, source_crop, distorted_crop)
+
+    # Auto picks its model from the size frames are compared at, which is
+    # only known now: it depends on the scale direction and on crops that
+    # were detected a moment ago, not on either input's own resolution.
+    dimensions = analysis_dimensions(source_info, distorted_info, options, source_crop, distorted_crop)
+    effective_model = _auto_model_or(options, dimensions)
+    options = _with_v1_model(options, dimensions)
+
+    def build_command(plan, model, log_path, xpsnr_log_path):
+        filtergraph = _build_filtergraph(
+            source_info, distorted_info, options, source_crop, distorted_crop, plan, log_path,
+            model=model, xpsnr_log_path=xpsnr_log_path,
+        )
+        return _build_ffmpeg_cmd(
+            distorted_info.path, source_info.path, filtergraph, plan, options.duration_limit,
+        )
+
+    total_frames = estimate_total_frames(distorted_info, options, source_info)
+    frames = None
+    # On the GPU only when VMAF and NEG are all the run scores: the window's
+    # runs split them from FFmpeg's other metrics (worker, GPU_VMAF). One
+    # FFmpeg feeding both, which nothing used any more, could see its GPU
+    # result refused for a frame count FFmpeg's filters disagreed with, and
+    # the whole run made again on the CPU.
+    gpu_models = None
+    if not set(options.requested_metrics()) - {"vmaf", "vmaf_neg"}:
+        gpu_models = vmaf_cuda.scores_on_gpu(options.compute_vmaf, options.compute_vmaf_neg, effective_model,
+                                             options.vmaf_on_gpu, analysis_bit_depth(source_info, distorted_info),
+                                             size=dimensions)
+    if gpu_models is not None:
+        plan = _GpuPlan(gpu_models, *dimensions, analysis_bit_depth(source_info, distorted_info))
+        frames = _run_on_gpu(
+            plan, source_info, distorted_info, options, source_crop, distorted_crop, effective_model, hwaccel,
+            total_frames, on_progress=on_progress, on_status=on_status, cancel_event=cancel_event,
+            process_handle=process_handle,
+        )
+        if frames is None:
+            gpu_models = None
+    if frames is None:
+        frames = _execute_run(
+            build_command,
+            options=options,
+            model=effective_model,
+            fps=distorted_info.fps,
+            total_frames=total_frames,
+            hwaccel=hwaccel,
+            tmp_prefix="vmaf_run_",
+            on_progress=on_progress,
+            on_status=on_status,
+            cancel_event=cancel_event,
+            process_handle=process_handle,
+        )
+    compared = int(frames.frame[-1]) + 1 if len(frames) else 0
+    if (short := short_comparison(total_frames, compared, distorted_info.fps, options.n_subsample)) is not None:
+        raise VmafRunError(short)
+
+    return ComparisonResult(
+        source=source_info.path,
+        distorted=result_distorted_path or distorted_info.path,
+        frames=frames,
+        fps=distorted_info.fps,
+        model=effective_model,
+        source_crop=source_crop,
+        distorted_crop=distorted_crop,
+        source_info=source_info,
+        distorted_info=distorted_info,
+        scale_direction=options.scale_direction,
+        scale_algorithm=options.scale_algorithm,
+        compared_frame_count=total_frames,
+        model_choice=options.model_choice,
+        model_v1=options.model_v1,
+        model_choice_v1=options.model_choice_v1 if options.compute_vmaf_v1 else None,
+        metric_results=_metric_results_for_current_run(
+            frames, effective_model, options.model_v1, gpu_keys=set(gpu_models or ()) & set(frames.metric_keys),
+        ),
+    )
+
+
+#: How the status line a run sends when VMAF on the GPU fails begins: FFmpeg's
+#: libvmaf calculates it from then on. The worker recognises it, so the run
+#: line stops showing that video's VMAF as GPU work.
+VMAF_GPU_FAILED = "VMAF on the GPU failed"
+
+
+def _run_on_gpu(
+    plan: _GpuPlan, source_info: VideoInfo, distorted_info: VideoInfo, options: VmafOptions,
+    source_crop: CropBox | None, distorted_crop: CropBox | None, model: str, hwaccel: HwAccelPlan,
+    total_frames: int, *, on_progress, on_status, cancel_event, process_handle,
+) -> FrameScores | None:
+    """The run with VMAF and NEG on the GPU (vmaf_cuda), in a process of its
+    own: a crash in libvmaf or the NVIDIA driver ends that process, not the
+    app. None when it fails for any reason but Cancel: the run is then made
+    again with VMAF on the CPU, as on a PC without the GPU.
+
+    One GPU pass at a time with Vship's (gpu.GPU_PASS): VMAF on the GPU does
+    not run beside another video's GPU metrics."""
+    _log.info("VMAF on the GPU (%s): %s", ", ".join(plan.models.values()), vmaf_cuda.LIBRARY_BUILD)
+    if not GPU_PASS.acquire(blocking=False):
+        if on_status:
+            on_status(Status(GPU_WAIT_MESSAGE, kind=GPU_WAIT))
+        while not GPU_PASS.acquire(timeout=0.1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled("Cancelled by user")
+    try:
+        return run_isolated(
+            _score_on_gpu, plan, source_info, distorted_info, options, source_crop, distorted_crop, model, hwaccel,
+            total_frames, what="libvmaf", callbacks=("on_progress", "on_status"), on_progress=on_progress,
+            on_status=on_status, cancel_event=cancel_event, process_handle=process_handle, cancelled=Cancelled,
+        )
+    except Cancelled:
+        raise
+    except Exception as error:
+        _log.error("VMAF on the GPU failed; calculating it on the CPU: %s", error, exc_info=error)
+        if on_status:
+            on_status(Status(f"{VMAF_GPU_FAILED} ({error}); calculating it on the CPU…", kind=GPU_VMAF_FAILED))
+        return None
+    finally:
+        GPU_PASS.release()
+
+
+def _score_on_gpu(
+    plan: _GpuPlan, source_info: VideoInfo, distorted_info: VideoInfo, options: VmafOptions,
+    source_crop: CropBox | None, distorted_crop: CropBox | None, model: str, hwaccel: HwAccelPlan,
+    total_frames: int, *, on_progress=None, on_status=None, cancel_event=None, process_handle=None,
+) -> FrameScores:
+    """Run by _run_on_gpu in its own process: FFmpeg decodes and pairs the
+    frames as on the CPU, and they are fed to libvmaf.
+
+    When NVIDIA's decoder decodes both videos, they are decoded in this
+    process instead (vmaf_cuda.score_decoded): the same frames, without
+    FFmpeg's decode and the CPU copies and pipes behind it. If that
+    decoding fails after it has started, the run is made again with
+    FFmpeg's, as before."""
+    if hwaccel.source == "cuda" and hwaccel.distorted == "cuda":
+        try:
+            return _score_decoded_on_gpu(
+                plan, source_info, distorted_info, options, source_crop, distorted_crop, hwaccel, total_frames,
+                on_progress=on_progress, on_status=on_status, cancel_event=cancel_event,
+                process_handle=process_handle)
+        except gpu_frames.GpuDecodeUnavailableError as error:
+            _log.info("VMAF on the GPU: the videos are decoded by FFmpeg (%s)", error)
+        except gpu_frames.GpuDecodeFailedError as error:
+            _log.warning("GPU decoding for VMAF on the GPU failed; decoding through FFmpeg instead: %s", error)
+            if on_status:
+                on_status(f"GPU decoding failed ({error}); decoding through FFmpeg instead…")
+
+    def build_command(hw, resolved_model, log_path, xpsnr_log_path, gpu_outputs):
+        filtergraph = _build_filtergraph(
+            source_info, distorted_info, options, source_crop, distorted_crop, hw, log_path,
+            model=resolved_model, xpsnr_log_path=xpsnr_log_path, gpu_vmaf=True,
+        )
+        return _build_ffmpeg_cmd(distorted_info.path, source_info.path, filtergraph, hw,
+                                 options.duration_limit, gpu_outputs)
+
+    return _execute_run(
+        build_command, options=options, model=model, fps=distorted_info.fps, total_frames=total_frames,
+        hwaccel=hwaccel, tmp_prefix="vmaf_gpu_run_", on_progress=on_progress, on_status=on_status,
+        cancel_event=cancel_event, process_handle=process_handle, gpu=plan,
+    )
+
+
+def _score_decoded_on_gpu(
+    plan: _GpuPlan, source_info: VideoInfo, distorted_info: VideoInfo, options: VmafOptions,
+    source_crop: CropBox | None, distorted_crop: CropBox | None, hwaccel: HwAccelPlan, total_frames: int, *,
+    on_progress=None, on_status=None, cancel_event=None, process_handle=None,
+) -> FrameScores:
+    """VMAF and NEG from videos decoded in this process (vmaf_cuda.score_decoded),
+    over the frames _execute_run's FFmpeg would give libvmaf on the GPU."""
+    fps = distorted_info.fps
+    # As _execute_run: one frame more than the limit, which FFmpeg's libvmaf
+    # filter scores before its output stops.
+    limit = options.duration_limit + 1 / fps if options.duration_limit > 0 and fps > 0 else 0.0
+    if on_status:
+        on_status(Status.decoding("Running VMAF on the GPU", hwaccel, ending="..."))
+
+    def check_cancel() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled("Cancelled by user")
+
+    scores = vmaf_cuda.score_decoded(
+        source_info, distorted_info, source_crop, distorted_crop, width=plan.width, height=plan.height,
+        bit_depth=plan.bit_depth, models=plan.models, n_subsample=options.n_subsample,
+        duration_limit=f"{limit:.3f}" if limit > 0 else None, total_frames=total_frames,
+        scale_algorithm=options.scale_algorithm,
+        on_progress=on_progress, check_cancel=check_cancel, process_handle=process_handle)
+    frames = _gpu_frame_scores(scores, fps)
+    missing = [m for m in options.requested_metrics() if not frames.has(m)]
+    if not frames or missing:
+        raise VmafRunError("No results for requested metrics: " + ", ".join(missing or options.requested_metrics()))
+    return frames
+
+
+def run_resample_test(
+    source_info: VideoInfo,
+    options: VmafOptions,
+    on_progress: ProgressCallback | None = None,
+    on_status: Callable[[str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    process_handle: ProcessHandle | None = None,
+) -> ComparisonResult:
+    """Runs a resolution round-trip test (see VmafOptions.resample_test):
+    downscales the source to a target width, scales it back up to the
+    source's original resolution, and computes VMAF against the untouched
+    source -- from a single input file, not a second already-encoded one.
+    """
+    assert options.resample_test is not None
+
+    hwaccel = HwAccelPlan()
+    if options.gpu_decode:
+        # One input file, so there is no distorted side to decide.
+        hwaccel = plan_hwaccel(options.gpu_vendor, source_info.codec_name, source_pix_fmt=source_info.pix_fmt,
+                               source_size=(source_info.width, source_info.height))
+
+    source_crop: CropBox | None = None
+    if options.crop_mode == CropMode.AUTO:
+        if on_status:
+            on_status("Detecting black bars in source...")
+        try:
+            source_crop = detect_crop(
+                source_info, cancel_event=cancel_event, process_handle=process_handle,
+                hwaccel=hwaccel.source,
+            )
+        except CropDetectCancelled as e:
+            raise Cancelled("Cancelled by user") from e
+
+    dimensions = resample_analysis_dimensions(source_info, source_crop)
+    effective_model = _auto_model_or(options, dimensions)
+    options = _with_v1_model(options, dimensions)
+
+    def build_command(plan, model, log_path, xpsnr_log_path):
+        filtergraph = _build_resample_test_filtergraph(
+            source_info, options, source_crop, plan.source, log_path,
+            model=model, xpsnr_log_path=xpsnr_log_path,
+        )
+        return _build_resample_cmd(source_info.path, filtergraph, plan.source, options.duration_limit)
+
+    total_frames = estimate_total_frames(source_info, options)
+    frames = _execute_run(
+        build_command,
+        options=options,
+        model=effective_model,
+        fps=source_info.fps,
+        total_frames=total_frames,
+        hwaccel=hwaccel,
+        tmp_prefix="vmaf_resample_",
+        on_progress=on_progress,
+        on_status=on_status,
+        cancel_event=cancel_event,
+        process_handle=process_handle,
+    )
+
+    distorted_path = synthetic_resample_distorted_path(source_info.path, options.resample_test)
+    return ComparisonResult(
+        source=source_info.path,
+        distorted=distorted_path,
+        frames=frames,
+        fps=source_info.fps,
+        model=effective_model,
+        source_crop=source_crop,
+        distorted_crop=source_crop,  # same crop applies to both branches, since both come from the same source
+        source_info=source_info,
+        distorted_info=source_info,  # after the round trip it's back at the source's own resolution
+        scale_algorithm=options.scale_algorithm,
+        resample_target=options.resample_test,
+        compared_frame_count=total_frames,
+        model_choice=options.model_choice,
+        model_v1=options.model_v1,
+        model_choice_v1=options.model_choice_v1 if options.compute_vmaf_v1 else None,
+        metric_results=_metric_results_for_current_run(frames, effective_model, options.model_v1),
+    )
