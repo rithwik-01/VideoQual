@@ -1,0 +1,566 @@
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from tests.factories import STDLIB_PYTHON
+from videoqual.core import crop_detect
+from videoqual.core.crop_detect import _SAMPLE_WINDOW_SECONDS, CropDetectError, _sample_offsets
+from videoqual.core.models import CropBox, VideoInfo
+
+
+def test_crop_samples_never_start_beyond_the_last_full_window():
+    for duration in (1.0, 3.0, 5.0, 10.0, 60.0):
+        latest_valid_start = max(0.0, duration - _SAMPLE_WINDOW_SECONDS)
+        offsets = _sample_offsets(duration)
+        assert offsets
+        assert all(0.0 <= offset <= latest_valid_start for offset in offsets)
+
+
+def test_very_short_clip_is_sampled_once_from_the_start():
+    assert _sample_offsets(2.0) == [0.0]
+
+
+def test_auto_crop_failure_is_reported_instead_of_silently_using_full_frame(monkeypatch):
+    info = VideoInfo(
+        path=Path("broken.mp4"), width=1920, height=1080, fps=30.0,
+        duration=10.0, nb_frames=300, codec_name="h264",
+    )
+    def window(*a, **kw):
+        raise CropDetectError("ffmpeg exited with code 1")
+
+    monkeypatch.setattr(crop_detect, "_run_single_window", window)
+
+    with pytest.raises(CropDetectError, match=r"None \(use full frame\)"):
+        crop_detect.detect_crop(info)
+
+
+def test_a_video_with_no_pictures_where_sampled_is_not_told_to_turn_cropping_off(monkeypatch):
+    """A file cut short decodes nothing where its length says it has
+    pictures. Cropping off would only score the few it has."""
+    info = VideoInfo(
+        path=Path("broken.mp4"), width=1920, height=1080, fps=30.0,
+        duration=10.0, nb_frames=300, codec_name="h264",
+    )
+    monkeypatch.setattr(crop_detect, "_run_single_window", lambda *a, **kw: None)
+
+    with pytest.raises(CropDetectError, match="damaged or cut short") as raised:
+        crop_detect.detect_crop(info)
+    assert "None (use full frame)" not in str(raised.value)
+
+
+def test_cancel_wins_over_windows_that_already_answered(monkeypatch):
+    """Some windows may have a box in hand by the time Cancel lands. A partial
+    vote is not an answer the caller asked for: cancellation is reported, and
+    nothing is returned."""
+    info = VideoInfo(
+        path=Path("movie.mp4"), width=1920, height=1080, fps=30.0,
+        duration=60.0, nb_frames=1800, codec_name="h264",
+    )
+    cancel = threading.Event()
+
+    def window(*args, **kwargs):
+        cancel.set()
+        return crop_detect.CropBox(1920, 1080, 0, 0)
+
+    monkeypatch.setattr(crop_detect, "_run_single_window", window)
+
+    with pytest.raises(crop_detect.CropDetectCancelled):
+        crop_detect.detect_crop(info, cancel_event=cancel)
+
+
+def test_a_window_does_not_launch_once_cancelled():
+    # The real window checks before starting a process, so a cancel that
+    # lands while others are running never starts another ffmpeg.
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(crop_detect.CropDetectCancelled):
+        crop_detect._run_single_window("movie.mp4", 0.0, 3.0, 0.1, cancel_event=cancel)
+
+
+def test_windows_run_one_at_a_time(monkeypatch):
+    """Each window is its own decoder. Five at once held 6.2 GB of VRAM for a
+    4K source on the GPU decoder, and two inputs reached ten decoders, so the
+    windows of one input never overlap."""
+    info = VideoInfo(
+        path=Path("movie.mp4"), width=1920, height=1080, fps=30.0,
+        duration=60.0, nb_frames=1800, codec_name="h264",
+    )
+    running = 0
+    peak = 0
+    calls = 0
+    lock = threading.Lock()
+
+    def window(*args, **kwargs):
+        nonlocal running, peak, calls
+        with lock:
+            running += 1
+            calls += 1
+            peak = max(peak, running)
+        time.sleep(0.02)
+        with lock:
+            running -= 1
+        return crop_detect.CropBox(1920, 800, 0, 140)
+
+    monkeypatch.setattr(crop_detect, "_run_single_window", window)
+
+    assert crop_detect.detect_crop(info) == crop_detect.CropBox(1920, 800, 0, 140)
+    assert calls == crop_detect._SAMPLE_COUNT
+    assert peak == 1, "two windows of one input decoded at the same time"
+
+
+# ------------------------------------------------------------- the cache
+
+def _real_file(tmp_path, name="movie.mkv", duration=60.0) -> VideoInfo:
+    path = tmp_path / name
+    path.write_bytes(b"x" * 1000)
+    return VideoInfo(
+        path=path, width=1920, height=1080, fps=30.0,
+        duration=duration, nb_frames=int(duration * 30), codec_name="h264",
+    )
+
+
+def test_a_files_bars_are_detected_once_per_process(monkeypatch, tmp_path):
+    """Six encodes of one film detected the source's bars six times over --
+    thirty ffmpeg processes for one answer."""
+    info = _real_file(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        crop_detect, "_run_single_window",
+        lambda *a, **kw: (calls.append(a[1]), crop_detect.CropBox(1920, 800, 0, 140))[1],
+    )
+
+    first = crop_detect.detect_crop(info)
+    launched = len(calls)
+    second = crop_detect.detect_crop(info)
+
+    assert first == second
+    assert launched == 5
+    assert len(calls) == launched, "the second call ran detection again"
+
+
+def test_a_different_scored_stretch_is_a_different_answer(monkeypatch, tmp_path):
+    # The samples are taken from inside the stretch that will be scored, so
+    # a duration limit changes what is measured and must not reuse the
+    # full-length answer.
+    info = _real_file(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        crop_detect, "_run_single_window",
+        lambda *a, **kw: (calls.append(a[1]), crop_detect.CropBox(1920, 800, 0, 140))[1],
+    )
+
+    crop_detect.detect_crop(info)
+    crop_detect.detect_crop(info, duration_limit=10.0)
+
+    assert len(calls) == 10
+
+
+def test_a_replaced_file_is_detected_afresh(monkeypatch, tmp_path):
+    info = _real_file(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        crop_detect, "_run_single_window",
+        lambda *a, **kw: (calls.append(a[1]), crop_detect.CropBox(1920, 800, 0, 140))[1],
+    )
+    crop_detect.detect_crop(info)
+
+    info.path.write_bytes(b"y" * 2000)  # new size: a different file
+    crop_detect.detect_crop(info)
+
+    assert len(calls) == 10
+
+
+def test_a_failed_detection_is_not_remembered(monkeypatch, tmp_path):
+    info = _real_file(tmp_path)
+    monkeypatch.setattr(crop_detect, "_run_single_window", lambda *a, **kw: None)
+    with pytest.raises(CropDetectError):
+        crop_detect.detect_crop(info)
+
+    monkeypatch.setattr(
+        crop_detect, "_run_single_window",
+        lambda *a, **kw: crop_detect.CropBox(1920, 800, 0, 140),
+    )
+    assert crop_detect.detect_crop(info) == crop_detect.CropBox(1920, 800, 0, 140)
+
+
+def test_two_callers_for_one_file_share_a_single_detection(monkeypatch, tmp_path):
+    """Two parallel lanes starting on the same source at the same moment
+    used to launch ten processes for one answer. The second now waits for
+    the first."""
+    info = _real_file(tmp_path)
+    calls = []
+    lock = threading.Lock()
+
+    def window(*a, **kw):
+        with lock:
+            calls.append(a[1])
+        time.sleep(0.1)
+        return crop_detect.CropBox(1920, 800, 0, 140)
+
+    monkeypatch.setattr(crop_detect, "_run_single_window", window)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(crop_detect.detect_crop(info)))
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == [crop_detect.CropBox(1920, 800, 0, 140)] * 2
+    assert len(calls) == 5
+
+
+# ------------------------------------------------------- GPU decode
+
+@pytest.mark.parametrize("hwaccel", ["cuda", "qsv", "d3d11va"])
+def test_a_window_decodes_on_whatever_gpu_the_run_will_use(monkeypatch, hwaccel):
+    """No vendor is named in crop detection. It takes the decoder the run's
+    own plan chose -- NVIDIA, Intel or AMD, whatever this machine has and
+    this ffmpeg build supports -- and passes it through unchanged."""
+    seen = []
+
+    def fake_launch(cmd, cancel_event, process_handle):
+        seen.append(cmd)
+        return 0, "crop=1920:800:0:140"
+
+    monkeypatch.setattr(crop_detect, "_launch_window", fake_launch)
+
+    box = crop_detect._run_single_window(
+        "movie.mkv", 5.0, 3.0, 0.1, hwaccel=hwaccel, download_format="p010le"
+    )
+
+    assert box == crop_detect.CropBox(1920, 800, 0, 140)
+    (cmd,) = seen
+    assert cmd[cmd.index("-hwaccel") + 1] == hwaccel
+    assert cmd[cmd.index("-hwaccel_output_format") + 1] == {"d3d11va": "d3d11"}.get(hwaccel, hwaccel)
+    assert cmd.index("-hwaccel") < cmd.index("-i")  # a per-input option
+    assert "hwdownload,format=p010le,cropdetect=" in cmd[cmd.index("-vf") + 1]
+
+
+def test_crop_detection_names_no_vendor_of_its_own():
+    # Belt and braces for the above: the module has no idea what a GPU is.
+    source = Path(crop_detect.__file__).read_text(encoding="utf-8").lower()
+    for word in ("cuda", "qsv", "d3d11", "nvidia", "intel", "amd", "vaapi", "videotoolbox"):
+        assert word not in source, f"crop_detect hardcodes {word!r}"
+
+
+def test_a_failed_gpu_window_falls_back_to_software(monkeypatch):
+    # No free decoder session, an unsupported profile: the metric run falls
+    # back to the CPU, and so does this. Same pixels, same box.
+    seen = []
+
+    def fake_launch(cmd, cancel_event, process_handle):
+        seen.append(cmd)
+        if "-hwaccel" in cmd:
+            return 1, "Failed to initialise hwaccel"
+        return 0, "crop=1920:800:0:140"
+
+    monkeypatch.setattr(crop_detect, "_launch_window", fake_launch)
+
+    box = crop_detect._run_single_window("movie.mkv", 5.0, 3.0, 0.1, hwaccel="cuda")
+
+    assert box == crop_detect.CropBox(1920, 800, 0, 140)
+    assert len(seen) == 2
+    assert "-hwaccel" not in seen[1]
+    assert seen[1][seen[1].index("-vf") + 1].startswith("cropdetect=")
+
+
+def test_no_gpu_means_no_fallback_attempt(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        crop_detect, "_launch_window",
+        lambda cmd, *_: (seen.append(cmd), (1, "boom"))[1],
+    )
+    with pytest.raises(CropDetectError):
+        crop_detect._run_single_window("movie.mkv", 5.0, 3.0, 0.1)
+    assert len(seen) == 1
+
+
+# ---------------------------------------- sampling inside a duration limit
+
+def _info(duration: float = 10.0) -> VideoInfo:
+    return VideoInfo(
+        path=Path("movie.mkv"), width=320, height=180, fps=30.0,
+        duration=duration, nb_frames=int(duration * 30), codec_name="h264",
+    )
+
+
+def _recorded_windows(monkeypatch) -> list[tuple[float, float]]:
+    """Captures every (start, window) crop detection actually reads."""
+    seen: list[tuple[float, float]] = []
+
+    def fake_window(path, start, window, limit, **kwargs):
+        seen.append((start, window))
+        return crop_detect.CropBox(w=320, h=180, x=0, y=0)
+
+    monkeypatch.setattr(crop_detect, "_run_single_window", fake_window)
+    return seen
+
+
+@pytest.mark.parametrize("limit", [0.8, 2.0, 5.0])
+def test_no_crop_sample_reaches_past_the_duration_limit(monkeypatch, limit):
+    """A film that is full-frame for its opening seconds and letterboxed
+    afterwards was measured on footage the comparison never looks at, so the
+    detected bars were cropped away from content that really is there.
+
+    Verified against a generated fixture (10s, full-frame for 1s then
+    letterboxed): with a 0.8s limit this returned 320x100+0+40 before, and
+    320x180 after.
+    """
+    seen = _recorded_windows(monkeypatch)
+
+    crop_detect.detect_crop(_info(10.0), duration_limit=limit)
+
+    assert seen, "no samples were taken"
+    for start, window in seen:
+        assert start >= 0.0
+        assert start + window <= limit + 1e-6, (
+            f"a sample read {start}..{start + window}s, past the {limit}s limit"
+        )
+
+
+def test_a_limit_shorter_than_one_window_still_takes_a_sample(monkeypatch):
+    # The analysis window is 3s by default. A 0.8s limit has to shrink it
+    # rather than read 3s of footage or give up and sample nothing.
+    seen = _recorded_windows(monkeypatch)
+
+    crop_detect.detect_crop(_info(10.0), duration_limit=0.8)
+
+    assert len(seen) == 1
+    start, window = seen[0]
+    assert (start, round(window, 6)) == (0.0, 0.8)
+
+
+def test_no_limit_samples_the_whole_video_as_before(monkeypatch):
+    seen = _recorded_windows(monkeypatch)
+
+    crop_detect.detect_crop(_info(10.0))
+
+    assert sorted(round(s, 3) for s, _w in seen) == [1.0, 2.5, 4.0, 5.5, 7.0]
+    assert {w for _s, w in seen} == {_SAMPLE_WINDOW_SECONDS}
+
+
+def test_a_limit_longer_than_the_video_changes_nothing(monkeypatch):
+    seen = _recorded_windows(monkeypatch)
+
+    crop_detect.detect_crop(_info(10.0), duration_limit=30.0)
+
+    assert sorted(round(s, 3) for s, _w in seen) == [1.0, 2.5, 4.0, 5.5, 7.0]
+
+
+@pytest.mark.parametrize("resample", [False, True])
+def test_metric_run_crop_detection_ignores_score_duration_limit(monkeypatch, resample):
+    """Black-bar detection samples representative parts of the full video,
+    even when the metric itself is limited to a short opening segment."""
+    from videoqual.core import vmaf_runner
+    from videoqual.core.models import CropMode, ResampleTarget, VmafOptions
+
+    seen: list[float | None] = []
+
+    def fake_detect(info, **kwargs):
+        seen.append(kwargs.get("duration_limit"))
+        raise crop_detect.CropDetectCancelled("stop here")
+
+    monkeypatch.setattr(vmaf_runner, "detect_crop", fake_detect)
+    options = VmafOptions(
+        crop_mode=CropMode.AUTO, duration_limit=1.5,
+        resample_test=ResampleTarget(width=160, label="160") if resample else None,
+    )
+    source = _info(10.0)
+
+    with pytest.raises(vmaf_runner.Cancelled):
+        if resample:
+            vmaf_runner.run_resample_test(source, options)
+        else:
+            vmaf_runner._resolve_crops(source, _info(10.0), options, None)
+
+    assert seen and all(limit is None for limit in seen)
+
+
+def test_no_more_than_two_detection_decoders_run_in_the_whole_app(monkeypatch):
+    """Several jobs detecting at once -- two parallel jobs, each with two
+    inputs -- still never have more than two decoders running."""
+    running = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class FakeProcess:
+        pid = 1
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            nonlocal running
+            time.sleep(0.03)
+            with lock:
+                running -= 1
+            return "", "crop=1920:800:0:140"
+
+    def fake_popen(*args, **kwargs):
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        return FakeProcess()
+
+    monkeypatch.setattr(crop_detect.proc_util, "popen", fake_popen)
+    threads = [
+        threading.Thread(target=crop_detect._launch_window, args=(["ffmpeg"], None, None))
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert peak == crop_detect._MAX_DETECTION_DECODERS == 2
+
+
+def test_a_curly_quote_in_ffmpegs_stderr_is_read_as_utf8(monkeypatch):
+    """ffmpeg's stderr opens with the input's path and tags, in UTF-8. Read
+    as cp1252, the 0x9D byte of ” killed the reader thread and stderr came
+    back as None, so the box search raised and the run failed."""
+    stderr = (
+        "Input #0, matroska,webm, from 'Director’s Cut “Final”.mkv':\n"
+        "    title           : Director’s Cut “Final”\n"
+        "[Parsed_cropdetect_0 @ 0000] x1:0 x2:1919 y1:140 y2:939 w:1920 h:800 x:0 y:140 crop=1920:800:0:140\n"
+    )
+    script = f"import sys; sys.stderr.buffer.write({stderr.encode('utf-8')!r})"
+    real_popen = crop_detect.proc_util.popen
+    monkeypatch.setattr(crop_detect.proc_util, "popen",
+                        lambda cmd, **kw: real_popen([STDLIB_PYTHON, "-S", "-c", script], **kw))
+
+    box = crop_detect._run_single_window("Director’s Cut “Final”.mkv", 0.0, 3.0, 24 / 255)
+
+    assert (box.w, box.h, box.x, box.y) == (1920, 800, 0, 140)
+
+
+def test_waiting_for_a_decoder_slot_still_answers_cancel():
+    cancel = threading.Event()
+    cancel.set()
+    for _ in range(crop_detect._MAX_DETECTION_DECODERS):
+        crop_detect._decoder_slots.acquire()
+    try:
+        with pytest.raises(crop_detect.CropDetectCancelled):
+            crop_detect._launch_window(["ffmpeg"], cancel, None)
+    finally:
+        for _ in range(crop_detect._MAX_DETECTION_DECODERS):
+            crop_detect._decoder_slots.release()
+
+
+def test_a_comparisons_two_inputs_are_detected_at_the_same_time():
+    """Two decoders -- the app-wide limit -- and half the wall time."""
+    running = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def detect(box):
+        def run():
+            nonlocal running, peak
+            with lock:
+                running += 1
+                peak = max(peak, running)
+            time.sleep(0.05)
+            with lock:
+                running -= 1
+            return box
+        return run
+
+    a, b = crop_detect.CropBox(1920, 800, 0, 140), crop_detect.CropBox(1920, 1080, 0, 0)
+    assert crop_detect.detect_pair(detect(a), detect(b)) == (a, b)
+    assert peak == 2
+
+
+def test_pair_detection_waits_for_both_and_prefers_cancel_over_errors():
+    finished = []
+
+    def fails():
+        raise CropDetectError("reference unreadable")
+
+    def cancelled():
+        time.sleep(0.05)
+        finished.append("test")
+        raise crop_detect.CropDetectCancelled("stop")
+
+    with pytest.raises(crop_detect.CropDetectCancelled):
+        crop_detect.detect_pair(fails, cancelled)
+    assert finished == ["test"], "raised before the other input had finished"
+
+    with pytest.raises(CropDetectError, match="reference"):
+        crop_detect.detect_pair(fails, lambda: crop_detect.CropBox(1, 1, 0, 0))
+
+
+def test_the_picture_found_is_logged(monkeypatch, caplog):
+    import logging
+
+    from videoqual.core import crop_detect
+    from videoqual.core.models import CropBox
+
+    caplog.set_level(logging.INFO, logger="videoqual")
+    monkeypatch.setattr(crop_detect, "_run_single_window", lambda *a, **k: CropBox(w=3840, h=1608, x=0, y=276))
+    info = VideoInfo(Path("film.mkv"), 3840, 2160, 24.0, 600.0, 14400, "hevc", pix_fmt="yuv420p10le")
+    crop_detect.detect_crop(info)
+    assert "Black bars in film.mkv: picture 3840x1608 at 0,276 of 3840x2160" in caplog.text
+
+
+def _sized(width, height):
+    from videoqual.core.models import VideoInfo
+
+    return VideoInfo(Path(f"{width}x{height}.mkv"), width, height, 24.0, 10.0, 240, "hevc", pix_fmt="yuv420p")
+
+
+def test_two_boxes_a_row_apart_become_the_picture_both_show():
+    """An encode's soft bar edge put its box two rows from the source's:
+    1920x800 against 1920x802, compared by scaling one onto the other."""
+    from videoqual.core.crop_detect import common_picture
+
+    source, test = common_picture(_sized(1920, 1080), _sized(1920, 1080),
+                                  CropBox(1920, 800, 0, 140), CropBox(1920, 802, 0, 138))
+    assert source == test == CropBox(1920, 800, 0, 140)
+
+
+def test_the_same_picture_at_two_sizes_is_matched_in_each_ones_pixels():
+    from videoqual.core.crop_detect import common_picture
+
+    source, test = common_picture(_sized(3840, 2160), _sized(1920, 1080),
+                                  CropBox(3840, 1600, 0, 280), CropBox(1920, 804, 0, 138))
+    assert source == CropBox(3840, 1600, 0, 280)
+    assert test == CropBox(1920, 800, 0, 140)
+
+
+def test_agreeing_boxes_are_left_as_they_are():
+    from videoqual.core.crop_detect import common_picture
+
+    boxes = CropBox(3840, 1600, 0, 280), CropBox(1920, 800, 0, 140)
+    assert common_picture(_sized(3840, 2160), _sized(1920, 1080), *boxes) == boxes
+
+
+def test_videos_of_different_shapes_keep_their_own_boxes():
+    """An encode already cropped to the picture is a different shape from
+    its letterboxed source: the boxes are each video's own business."""
+    from videoqual.core.crop_detect import common_picture
+
+    boxes = CropBox(1920, 800, 0, 140), CropBox(1920, 800, 0, 0)
+    assert common_picture(_sized(1920, 1080), _sized(1920, 800), *boxes) == boxes
+
+
+def test_a_missing_box_is_left_alone():
+    from videoqual.core.crop_detect import common_picture
+
+    assert common_picture(_sized(1920, 1080), _sized(1920, 1080), None, CropBox(1920, 800, 0, 140)) == (
+        None, CropBox(1920, 800, 0, 140))
+
+
+def test_equally_common_boxes_go_to_the_larger(monkeypatch):
+    """A dark stretch reads its dark picture as bar: its box is too tight.
+    A tie went to whichever window answered first."""
+    crop_detect.clear_cache()
+    boxes = iter([CropBox(1920, 696, 0, 192), CropBox(1920, 800, 0, 140), CropBox(1920, 696, 0, 192),
+                  CropBox(1920, 800, 0, 140), None])
+    monkeypatch.setattr(crop_detect, "_run_single_window", lambda *a, **k: next(boxes))
+    info = VideoInfo(path=Path("tie.mkv"), width=1920, height=1080, fps=24.0, duration=600.0, nb_frames=14400,
+                     codec_name="hevc")
+    assert crop_detect.detect_crop(info) == CropBox(1920, 800, 0, 140)
